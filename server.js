@@ -1,77 +1,132 @@
-import express from 'express'
-import cors from 'cors'
-import http from 'http'
-import {Server} from 'socket.io'
-import { userConnected, userDisconnected } from './sockets/user.js';
+import fs from "fs";
+import express from "express";
+import cors from "cors";
+import http from "http";
+import { Server } from "socket.io";
+import { userConnected, userDisconnected } from "./sockets/user.js";
 
-const app= express();
-const PORT= process.env.PORT || 3001;
+const app = express();
+const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 
-const server= http.createServer(app);
+const server = http.createServer(app);
 
-const io= new Server(server, {
-    cors: {
-        origin: '*'
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+  },
+});
+
+io.on("connection", (socket) => {
+  const users = Array.from(io.sockets.sockets).map((socket) => socket[0]);
+
+  userConnected(socket, users);
+  socket.on("disconnect", () => userDisconnected(socket, users));
+
+  socket.on("remove-room-user", ({ roomId, userId }) => {
+    console.log("Removing user from the room ", roomId);
+
+    let fileData = fs.readFileSync("data.json");
+    fileData = JSON.parse(fileData);
+    const roomUsers = fileData.roomUsers[roomId];
+    fileData.roomUsers[roomId] = roomUsers.filter((item) => item !== userId);
+    fs.writeFileSync("data.json", JSON.stringify(fileData));
+
+    socket.emit("response-stats", { data: fileData });
+    socket.broadcast.emit("response-stats", { data: fileData });
+  });
+
+  socket.on("request-stats", () => {
+    let fileData = fs.readFileSync("data.json");
+    fileData = JSON.parse(fileData);
+
+    socket.emit("response-stats", { data: fileData });
+    socket.broadcast.emit("response-stats", { data: fileData });
+  });
+
+  socket.on("reset-personal-stats", ({ userId }) => {
+    let fileData = fs.readFileSync("data.json");
+    fileData = JSON.parse(fileData);
+
+    const userIndex = fileData.users.findIndex((user) => user.id === userId);
+    if (userIndex >= 0) {
+      fileData.users[userIndex].stats = { heads: 0, tails: 0 };
+      fs.writeFileSync("data.json", JSON.stringify(fileData));
+      socket.emit("response-stats", { data: fileData });
     }
-})
+  });
 
-let heads= 0;
-let tails= 0;
-let roomUsers= {};
-let users= [];
- 
-io.on('connection', (socket) =>{
-    users= Array.from(io.sockets.sockets).map(socket => socket[0]);
+  socket.on("join-room", ({ roomId }) => {
+    socket.join(roomId);
+    socket.room = roomId;
 
-    userConnected(socket, users);
-    socket.on('disconnect', ()=> userDisconnected(socket, users));
+    let fileData = fs.readFileSync("data.json");
+    fileData = JSON.parse(fileData);
+    if (fileData.roomUsers[roomId] === undefined) {
+      fileData.roomUsers[roomId] = [];
+    }
+    fileData.roomUsers[roomId].push(socket.id);
+    fs.writeFileSync("data.json", JSON.stringify(fileData));
 
-    socket.on('request-stats', ()=>{
-        socket.emit('response-stats', {heads, tails})
-    })
+    socket.to(roomId).emit("user-joined", fileData.roomUsers[roomId]);
+    socket.emit("response-stats", { data: fileData });
+    socket.broadcast.emit("response-stats", { data: fileData });
 
-    socket.on('join-room', ({roomId})=>{
-        socket.join(roomId);
-        socket.room= roomId;
-        if(roomUsers[roomId]===undefined){
-            roomUsers[roomId]= [];
-            roomUsers[roomId].push(socket.id);
-        } else{
-            roomUsers[roomId].push(socket.id);
-        }
-        console.log(`Users ${roomId} : ${roomUsers[roomId]}`);
-        socket.to(roomId).emit('user-joined', roomUsers[roomId]);
-        socket.emit('user-joined', roomUsers[roomId]);
-        socket.emit('response-users', users.length);
-    })
+    console.log(`Users ${roomId} : ${fileData.roomUsers[roomId]}`);
+  });
 
-    socket.on('leave-room', ({roomId})=>{
-        roomUsers[roomId]= roomUsers[roomId].filter(user => user!==socket.id);
-        socket.to(roomId).emit('user-left', roomUsers[roomId]);
-        socket.emit('user-left', []);
-        socket.leave(roomId);
-        console.log(`Users ${roomId} : ${roomUsers[roomId]}`);
-    })
+  socket.on("leave-room", ({ roomId }) => {
+    let fileData = fs.readFileSync("data.json");
+    fileData = JSON.parse(fileData);
+    fileData.roomUsers[roomId] = fileData.roomUsers[roomId].filter(
+      (userId) => userId !== socket.id
+    );
+    fs.writeFileSync("data.json", JSON.stringify(fileData));
 
-    socket.on('toss-start', ({roomId, result})=>{
-        console.log('socket room : ', socket.room);
-        if(result==='Heads'){
-            heads++;
-        } else{
-            tails++;
-        }
-        socket.emit('increment', {heads, tails});
-        socket.broadcast.emit('increment', {heads, tails});
-        socket.to(roomId).emit('toss-started', result);
-    })
-})
+    socket.to(roomId).emit("user-left", fileData.roomUsers[roomId]);
+    socket.leave(roomId);
+    socket.emit("response-stats", { data: fileData });
+    socket.broadcast.emit("response-stats", { data: fileData });
 
-app.get('/', (req, res)=>{
-    res.send(`Total : ${heads+tails} --- Heads : ${heads} --- Tails : ${tails}`);
-})
+    console.log(`Users ${roomId} : ${fileData.roomUsers[roomId]}`);
+  });
 
-server.listen(PORT, ()=>{
-    console.log('Socket.io Chat Room server started on PORT : ', PORT);
-})
+  socket.on("toss-start", ({ roomId }) => {
+    const tossResult = Math.random() < 0.5 ? "heads" : "tails";
+    socket.to(roomId).emit("toss-started");
+
+    let fileData = fs.readFileSync("data.json");
+    fileData = JSON.parse(fileData);
+    if (tossResult === "heads") {
+      fileData.heads++;
+    } else {
+      fileData.tails++;
+    }
+    const currentUserIndex = fileData.users.findIndex(
+      (user) => user.id === socket.id
+    );
+    if (currentUserIndex >= 0 && tossResult === "heads") {
+      fileData.users[currentUserIndex].stats.heads++;
+    } else if (currentUserIndex >= 0 && tossResult === "tails") {
+      fileData.users[currentUserIndex].stats.tails++;
+    }
+    fs.writeFileSync("data.json", JSON.stringify(fileData));
+
+    setTimeout(() => {
+      socket.emit("send-toss-result", { tossResult });
+      socket.to(roomId).emit("send-toss-result", { tossResult });
+
+      socket.emit("response-stats", { data: fileData });
+      socket.broadcast.emit("response-stats", { data: fileData });
+    }, 1500);
+  });
+});
+
+app.get("/", async (req, res) => {
+  res.send("FlipByClick Server!");
+});
+
+server.listen(PORT, () => {
+  console.log("Flip-by-click server started on PORT : ", PORT);
+});
